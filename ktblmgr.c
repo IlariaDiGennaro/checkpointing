@@ -50,6 +50,7 @@
 #include <linux/vmalloc.h>
 
 
+
 #include "ktblmgr.h"
 
 #define AUXILIARY_FRAMES 256
@@ -127,270 +128,131 @@ struct file_operations fops = {
 /// This is to access the actual flush_tlb_all using a kernel proble
 void (*flush_tlb_all_lookup)(void) = NULL;
 
-//#define ACCESSES_ABR
-
-#ifdef ACCESSES_ABR
-	#define OFFSET_ZONE_BIT 21
-	#define ZONE2M_NUMBER(address) (unsigned int)(((unsigned long)address >> OFFSET_ZONE_BIT)&0x7ffffff)
-	#define NUMBER_BYTES 64
+#define ACCESSES_HASHBUCKET
+/* Tabella Hash con trabocco, ogni entry della tabella punta ad una lista di 64 nodi, ogni nodo rappresenta una pde.
+ * In testa ad ogni lista c'è un ulteriore nodo, che punta al primo vero nodo della lista e tiene traccia dei 64
+ * nodi presenti nella lista. L'inserimento costa O(1) sia nel caso di lista vuota che non perchè, grazie al nodo
+ * "di controllo", viene fatto sempre in testa. Nel caso di nodo già presente, l'aggiornamento del nodo costa al
+ * più O(64) per lo scorrimento. Per ogni lista di nodi c'è un semaforo di mutua esclusione realizzato con la
+ * Compare-and-Swap (CAS) al byte. Realizzato solo l'inserimento dei nodi nelle varie liste e l'aggiornamento.
+ * Non realizzata l'eliminazione.  */
+#ifdef ACCESSES_HASHBUCKET
+	
+	#define NZONE2M (71303168)
+	#define NBUCKETS (1114112)
+	#define N_NODES_PER_BUCKET (64)
+	#define N_NODES_PER_BUCKET_LOG (6)
+	#define HASH_FUNCTION(address) (unsigned int)(((ulong)address & 0x0000fffff8000000)>>27)
+	#define ZONE2M(address) (unsigned int) (((ulong)address & 0x0000ffffffe00000)>>21)
 	
 	typedef struct{
-		void * node_dx;
-		void * node_sx;
-		unsigned int key;
-		unsigned char pages[NUMBER_BYTES];
+		unsigned int key_zone;
+		void * next_node;
+	}header;
+	
+	typedef struct{
+		unsigned long node_tracking;
+		void * first_real_node;
+	}control_node;
+	
+	#define SIZE_HEADER (sizeof(header))
+	#define SIZE_CONTROL_NODE (sizeof(control_node))
+	#define SIZE_PAGE_4K (4096)
+	#define NPTE (512)
+	#define MAX_SIZE_BODY_ENTRY ((SIZE_PAGE_4K - SIZE_HEADER)>>9)
+    /*#define M8 (MAX_SIZE_BODY_ENTRY==8?8:0)
+    #define M4 ((MAX_SIZE_BODY_ENTRY>=4 && MAX_SIZE_BODY_ENTRY<8)?4:0)
+    #define M2 ((MAX_SIZE_BODY_ENTRY>=2 && MAX_SIZE_BODY_ENTRY<4)?2:0)
+    #define M1 ((MAX_SIZE_BODY_ENTRY>=1 && MAX_SIZE_BODY_ENTRY<2)?1:0)
+    #define M (M8+M4+M2+M1)*/
+    #define MAX_SIZE_BODY_ENTRY_REAL ((MAX_SIZE_BODY_ENTRY==8?8:0)+((MAX_SIZE_BODY_ENTRY>=4 && MAX_SIZE_BODY_ENTRY<8)?4:0)+((MAX_SIZE_BODY_ENTRY>=2 && MAX_SIZE_BODY_ENTRY<4)?2:0)+((MAX_SIZE_BODY_ENTRY>=1 && MAX_SIZE_BODY_ENTRY<2)?1:0))
+ 	#define MAX_NUM_THREAD_PER_ENTRY (MAX_SIZE_BODY_ENTRY_REAL * 8)
+ 	#define WASTE_BITS (64-MAX_NUM_THREAD_PER_ENTRY)
+ 	#define NODE_GROUP(pde_relative) (pde_relative >> N_NODES_PER_BUCKET_LOG)
+ 	#define NODE_BIT(pde_relative) (pde_relative - (NODE_GROUP(pde_relative)<<N_NODES_PER_BUCKET_LOG))
+ 	#define CHECK_NODE(number_bit,node_tracking) (((1UL << ((ulong)number_bit & (BITS_PER_LONG -1))) & (node_tracking))>0?1:0)
+ 	
+	typedef struct{
+		unsigned char page_table[MAX_SIZE_BODY_ENTRY_REAL * NPTE];
+	}body;
+	
+	typedef struct{
+		header h;
+		body b;
 	}node;
 	
-	//gestione pila ausiliaria per visita in-ordine iterativa
-	typedef struct {
-		void * this;
-		void * next;
-		unsigned char flag;
-	}stack_frame_aux;
+	#define SIZE_NODE (sizeof(node))
 	
-	#define SIZE_STACK_FRAME sizeof(stack_frame_aux)
+	void * buckets[NBUCKETS];
+	//spinlock_t spinlocks[NBUCKETS] = {[0 ... (NBUCKETS-1)]=SPIN_LOCK_UNLOCKED};
+	unsigned char exclusion[NBUCKETS];
+	//struct mutex hash_mutex;
 	
-	stack_frame_aux * stack;
-	
-	void * stack_push(void * this_node, unsigned char this_flag){
-		stack_frame_aux * new_stack_frame = kzalloc(SIZE_STACK_FRAME,GFP_KERNEL);
-		new_stack_frame->this=this_node;
-		new_stack_frame->next=stack;
-		new_stack_frame->flag=this_flag;
-		stack = new_stack_frame;
-		return;
-	}
-	
-	stack_frame_aux * stack_pop(){
-		stack_frame_aux * pop = stack;
-		stack = stack->next;
-		return pop;
-	}
-	//
-	
-	#define SIZE_NODE sizeof(node)
-	
-	node * abr;
-	
-	struct mutex mutex_node;
-	
-	void add_node(unsigned int);
-	//node * add_node_aux(node *,unsigned int);
-	
-	void add_node(unsigned int pde){
-		mutex_lock(&mutex_node);
-		//abr = add_node_aux(abr,pde);
-		if(abr==NULL) {
-			abr = kzalloc(SIZE_NODE,GFP_KERNEL);
-			abr->key = pde;
-			goto end_add;
-		}
-		if(abr->key==pde) {
-			goto end_add;	
-		}
-		node * walker = abr;
-		node * walker1;
-		while(walker!=NULL){
-			if(pde == walker->key)
-				goto end_add;
-			if(pde > walker->key) {
-				walker1=walker;
-				walker=walker->node_dx;
-			}
-			else {
-				walker1=walker;
-				walker=walker->node_sx;
-			}
-		}
-		node * last_add = kzalloc(SIZE_NODE,GFP_KERNEL);
-		last_add->key=pde;
-		if(pde > walker1->key)
-			walker1->node_dx=last_add;
-		else
-			walker1->node_sx=last_add;
-		end_add: mutex_unlock(&mutex_node);
-		return;
-	}
-	/*node * add_node_aux(node * walker, unsigned int pde) {
-		//printk("pde=%d\n",pde);
-			if(walker==NULL) {
-				walker = kzalloc(SIZE_NODE,GFP_KERNEL);
-				walker->key = pde;
-	        	return walker;
-			}
-			if(walker->key==pde) {
-				return walker;	
-			}
-			if(pde > walker->key) {
-				walker->node_dx = add_node_aux(walker->node_dx,pde);
-				return walker;
-			}
-			else {
-				walker->node_sx=add_node_aux(walker->node_sx,pde);
-				return walker;
-			}
-	}*/
-	
-	unsigned char search_node(unsigned int pde) {
-		mutex_lock(&mutex_node);
-		node * walker = abr;
-		unsigned char ret = 0;
-		while(walker!=NULL) {
-			if(walker->key == pde) {
-				ret=1;
-				goto end_search;
-			}
-			if(pde > walker->key)
-				walker = walker->node_dx;
-			else
-				walker=walker->node_sx;
-		}
-		end_search: mutex_unlock(&mutex_node);
-		return ret;
-	}
-	
-	/*void in_order(node * walker){
-		if(walker==NULL)
-			return;
-		else {
-			in_order(walker->node_sx);
-			printk("%d\n",walker->key);
-			in_order(walker->node_dx);
-		}
-	}*/
-	
-	void in_order_iterative(){
-		mutex_lock(&mutex_node);
-		node * aux;
-		if(abr==NULL) {
-			printk("empty bst\n");
-			return;
-		}
-		stack_push(abr,0);
-		while(stack!=NULL){
-			stack_frame_aux * stack_walker = stack_pop();
-			aux = stack_walker->this;
-			if(stack_walker->flag==1){
-				//do something on the node
-				printk("pde_number=%d\n",aux->key);
-				kfree(stack_walker);
-			}
-			else {
-				
-				if(aux->node_dx!=NULL)
-					stack_push(aux->node_dx,0);
-				stack_push(aux,1);
-				if(aux->node_sx!=NULL)
-					stack_push(aux->node_sx,0);
-			}
-		}
-		mutex_unlock(&mutex_node);
+	void add_node(void * fault_address,unsigned char pgd_index){
 		
-	}
-	
-#endif
-
-#define ACCESSES_LIST
-
-#ifdef ACCESSES_LIST
-	#define N2MZONE 71303168
-	#define BODY_SIZE_ELEMENTS 64
-	#define BODY_SIZE_BYTE 1
-	#define OFFSET_ZONE_BIT 21
-	#define ZONE2M_NUMBER(address) (unsigned int)(((unsigned long)address >> OFFSET_ZONE_BIT)&0x7ffffff)
-	void * accesses[N2MZONE];
-	struct mutex mutex_node;
-	void add_node(unsigned int pd_entry) {
-		mutex_lock(&mutex_node);
-		if(accesses[pd_entry]==NULL) {
-			accesses[pd_entry] = kcalloc(BODY_SIZE_ELEMENTS,BODY_SIZE_BYTE,GFP_KERNEL);
-			mutex_unlock(&mutex_node);
-			return;
+			
+		unsigned int bucket_index = HASH_FUNCTION(fault_address);
+		//spin_lock(&(spinlocks[bucket_index]));
+		while(cmpxchg(&(exclusion[bucket_index]),0,1)); //while(lock==1)==while(locked)
+		printk("bucket_index=%d\n",bucket_index);
+		printk("key_zone=%d\n",ZONE2M(fault_address));
+		printk("pte=%d\n",PTE(fault_address));
+		printk("pde_relative=%d\n",PDE(fault_address));
+		control_node * head;
+		node * a_node;
+		if(buckets[bucket_index]==NULL) {
+			head = kzalloc(SIZE_CONTROL_NODE,GFP_KERNEL);
+			a_node=kzalloc(SIZE_NODE,GFP_KERNEL);
+			(a_node -> h).key_zone = ZONE2M(fault_address);
+			head->first_real_node=(void *) a_node;
+			set_bit(NODE_BIT(PDE(fault_address)),&(head->node_tracking));
+			//unsigned int tb = test_bit(NODE_BIT(PDE(fault_address)),&(head->node_tracking));
+			//printk("tb=%u\n",tb);
+			buckets[bucket_index]=head;
+			goto update_body;
 		}
 		else {
-			mutex_unlock(&mutex_node);
-			return;
+			head = buckets[bucket_index];
+			//if(!constant_test_bit(NODE_BIT(PDE(fault_address)),&(head->node_tracking))) {
+			if(!CHECK_NODE(NODE_BIT(PDE(fault_address)),head->node_tracking)) {
+				node * new_node = kzalloc(SIZE_NODE,GFP_KERNEL);
+				(new_node->h).key_zone=ZONE2M(fault_address);
+				(new_node->h).next_node = head->first_real_node;
+				head->first_real_node=new_node;
+				set_bit(NODE_BIT(PDE(fault_address)),&(head->node_tracking));
+				a_node = new_node;
+				goto update_body;
+			}
+			else {
+				a_node = head->first_real_node;
+				while((a_node->h).next_node!=NULL) {
+					if((a_node->h).key_zone == ZONE2M(fault_address))
+						goto update_body;
+					a_node = (node *) ((a_node->h).next_node);
+				}
+				if((a_node->h).key_zone==ZONE2M(fault_address))
+					goto update_body;
+			}
 		}
-	}
-	unsigned char search_node(unsigned int pd_entry) {
-		mutex_lock(&mutex_node);
-		void * ret = accesses[pd_entry];
-		mutex_unlock(&mutex_node);
-		if(ret!=NULL)
-			return 1;
-		else
-			return 0;
-	}
-	void iterate(){
-		mutex_lock(&mutex_node);
-		int i;
-		for(i=0; i<N2MZONE; i++){
-			if(accesses[i]!=NULL)
-				printk("pde %d is busy\n",i);
+		
+		update_body: 
+		if(pgd_index>=MAX_NUM_THREAD_PER_ENTRY)
+			goto end_add_node;
+		else {
+			unsigned char * pt = (unsigned char *)((a_node->b).page_table);
+			printk("pt=%p\n",pt);
+			unsigned char * pte = &(pt[MAX_SIZE_BODY_ENTRY_REAL*PTE(fault_address)]);
+			ulong * pte_long = (ulong *) pte;
+			printk("pte_long=%p,*pte_long=%u, sizeof(*pte_long)=%d\n",pte_long,*pte_long,sizeof(*pte_long));
+			//printk("WASTE_BITS=%d\n",WASTE_BITS);
+			set_bit((ulong)(pgd_index+WASTE_BITS),pte_long);
 		}
-		mutex_unlock(&mutex_node);
-		return;
+		//end_add_node: spin_unlock(&(spinlocks[bucket_index]));
+		end_add_node: exclusion[bucket_index]=0;
+		return;	
 	}
 	
 #endif
-
-//#define ACCESSES_MATRIX
-
-#ifdef ACCESSES_MATRIX 
- #define GROUP_SIZE_BIT 8
- #define GROUP_SIZE_BYTE 1
- #define GROUP_SIZE_BIT_LOG 3
- #define N2MZONE 71303168
- #define NGROUPS SIBLING_PGD / GROUP_SIZE_BIT
- //#define THREAD_GROUP_INDEX(pgd_index) (unsigned char)(pgd_index/GROUP_SIZE_BIT)
- #define THREAD_GROUP_INDEX(pgd_index) (unsigned char) (pgd_index >> GROUP_SIZE_BIT_LOG)
- //#define BIT_NUMBER (pgd_index) (unsigned char)((pgd_index)-((pgd_index)*(THREAD_GROUP_INDEX(pgd_index))))
- #define offset_zone 21
- #define ZONE2M_NUMBER(address) (unsigned int)(((unsigned long)address >> offset_zone)&0x7ffffff)
- #define BIT_PLACE(pgd_index) (pgd_index -(GROUP_SIZE_BIT * (THREAD_GROUP_INDEX(pgd_index))))
- void * accesses [NGROUPS];
- char * accesses_row;
- char bit_set[GROUP_SIZE_BIT]={1,2,4,8,16,32,64,128};
- char bit_reset[GROUP_SIZE_BIT]={254,253,251,247,239,223,191,127};
- unsigned char active_groups;
- 
- #define ACCESSES_ROW(pgd_index) (accesses[THREAD_GROUP_INDEX(pgd_index)])
- #define SET_ACCESSES(pgd_index,fault_address) (((char *)ACCESSES_ROW(pgd_index))[ZONE2M_NUMBER(fault_address)] |= bit_set[BIT_PLACE(pgd_index)])
- #define RESET_ACCESSES(pgd_index,entry) (((char *)ACCESSES_ROW(pgd_index))[entry] &= bit_reset[BIT_PLACE(pgd_index)])
- /*void set_accesses(unsigned char pgd_index,void * fault_address){
- 	unsigned int page_entry = ZONE2M_NUMBER(fault_address);
- 	unsigned char thread_index = THREAD_GROUP_INDEX(pgd_index);
- 	//unsigned char bit_place = pgd_index - (GROUP_SIZE_BIT * thread_index);
- 	unsigned char bit_place = BIT_PLACE(pgd_index);
- 	//char * accesses_row = accesses[thread_index];
- 	char * accesses_row = ACCESSES_ROW(pgd_index);
-	accesses_row[page_entry] |= bit_set[bit_place];
-	return;
- }*/
- 
- /*void reset_accesses(unsigned char pgd_index){
- 	unsigned char thread_index = THREAD_GROUP_INDEX(pgd_index);
- 	unsigned char bit_place = pgd_index - (GROUP_SIZE_BIT * thread_index);
- 	char * accesses_row = accesses[thread_index];
- 	int i;
- 	for(i=0;i<N2MZONE;i++) {
- 		accesses_row[i] = accesses_row[i] & bit_reset[bit_place];
-	}
- 	return;
- }*/
- 
-
- /*void reset_accesses_2(unsigned char pgd_index,unsigned int entry){
-  	unsigned char thread_index = THREAD_GROUP_INDEX(pgd_index);
- 	unsigned char bit_place = pgd_index - (GROUP_SIZE_BIT * thread_index);
- 	//unsigned int entry = ZONE2M_NUMBER(my_pd_entry);
- 	char * accesses_row = accesses[thread_index];
- 	//accesses_row[entry] = accesses_row[entry] & bit_reset[bit_place];
- 	accesses_row[entry] &= bit_reset[bit_place];
- 	return;
- }*/	
-#endif
-
 
 int root_sim_page_fault(struct pt_regs* regs, long error_code){
  	void* target_address;
@@ -429,43 +291,25 @@ int root_sim_page_fault(struct pt_regs* regs, long error_code){
 			 				ancestor_pd= (void**) __va((ulong)ancestor_pdp[PDP(target_address)] & 0xfffffffffffff000);
 			 				if(ancestor_pd[PDE(target_address)]!=NULL) {
 			 					printk("ancestor_pd[%d]!=NULL\n",PDE(target_address));
-			 					//#ifdef ACCESSES_ABR
-			 					//#ifdef ACCESSES_LIST
-			 						if(search_node(ZONE2M_NUMBER(target_address))==1)
-			 							printk("node %d present\n",ZONE2M_NUMBER(target_address));
-			 						else
-			 							printk("error: node %d not present\n",ZONE2M_NUMBER(target_address));
-			 					//#endif
-			 					//printk("zone number=%u\n",ZONE2M_NUMBER(target_address));
 			 					my_pd = (void **)__va((ulong) my_pdp[PDP(target_address)] & 0xfffffffffffff000);
 			 					if(my_pd[PDE(target_address)]!=NULL){
 			 						printk("my_pd[%d]!=NULL\n",PDE(target_address));
+			 						#ifdef ACCESSES_HASHBUCKET
+			 							add_node(target_address,i);
+			 						#endif
 			 						return 0;
 								}
 			 					else {
 			 						printk("my_pd[%d]=NULL\n",PDE(target_address));
 			 						my_pd[PDE(target_address)]=(ulong)ancestor_pd[PDE(target_address)];
-			 						#ifdef ACCESSES_MATRIX
-			 							//set_accesses(i,target_address);
-			 							SET_ACCESSES(i,target_address);
+			 						#ifdef ACCESSES_HASHBUCKET
+			 							add_node(target_address,i);
 			 						#endif
-			 						
-			 						
-			 						//accesses[accesses_table_entry(target_address)]=1;
-			 						//printk("accesses[%d]=%d\n",accesses_table_entry(target_address),accesses[accesses_table_entry(target_address)]);
-			 						
 			 						return 1;
 			 					}
 			 				}
 			 				else {
 			 					printk("ancestor_pd[%d]=NULL\n",PDE(target_address));
-			 					#ifdef ACCESSES_LIST
-			 						add_node(ZONE2M_NUMBER(target_address));
-			 					#endif
-			 					
-			 					#ifdef ACCESSES_ABR
-			 						add_node(ZONE2M_NUMBER(target_address));
-			 					#endif
 			 					return 0;
 							}
 			   			}
@@ -634,17 +478,6 @@ static long rs_ktblmgr_ioctl(struct file *filp, unsigned int cmd, unsigned long 
 		mutex_lock(&pgd_get_mutex);
 		for (i = 0; i < SIBLING_PGD; i++) {
 			if (original_view[i] == NULL) {
-				#ifdef ACCESSES_MATRIX
-					if(accesses[THREAD_GROUP_INDEX(i)]==NULL){
-						accesses[THREAD_GROUP_INDEX(i)]=vmalloc(N2MZONE*GROUP_SIZE_BYTE);
-						if(accesses[THREAD_GROUP_INDEX(i)]==NULL) {
-							ret = -1;
-							goto pgd_get_done;
-						}
-						memset(accesses[THREAD_GROUP_INDEX(i)],0,N2MZONE*GROUP_SIZE_BYTE);
-						active_groups++;
-					}
-				#endif
 				memcpy((void *)pgd_addr[i], (void *)(current->mm->pgd), 4096); /* copia della pgd originale per non avere subito dei page fault */
 				original_view[i] = current->mm;
 				descriptor = i;
@@ -681,23 +514,6 @@ static long rs_ktblmgr_ioctl(struct file *filp, unsigned int cmd, unsigned long 
                         				address=__pa((ulong)address);
                         				address = (ulong) address | (ulong) control_bits;
                         				my_pdp[j]=address;
-                        				
-                        				//#ifdef ACCESSES_ABR
-                        				//#ifdef ACCESSES_LIST
-                        					//if(arg == 0) {
-                        						ancestor_pd = (void **) __va((ulong) ancestor_pdp[j] & 0xfffffffffffff000);
-                        						for(k=0; k<512; k++){
-													if(ancestor_pd[k]!=NULL){
-														pd_entry = k;
-														zone_num_calc = j << 9;
-														pd_entry |= zone_num_calc;
-														zone_num_calc = i << 18;
-														pd_entry |= zone_num_calc;
-														add_node(pd_entry);
-													}
-					    						}
-											//}
-										//#endif
                     				}
                 				}
             				}
@@ -726,18 +542,6 @@ static long rs_ktblmgr_ioctl(struct file *filp, unsigned int cmd, unsigned long 
                 		for(j=0; j<512; j++) {
                    			if(my_pdp[j] != NULL) {
                        			my_pd = (void **)__va((unsigned long)my_pdp[j]&0xfffffffffffff000);
-                       			#ifdef ACCESSES_MATRIX
-                       				for(k=0; k<512; k++) {
-                       					if(my_pd[k]!=NULL){
-                       						pd_entry = k;
-                       						zone_num_calc = j << 9;
-                       						pd_entry |= zone_num_calc;
-                       						zone_num_calc = i << 18;
-                       						pd_entry |= zone_num_calc;
-                       						RESET_ACCESSES(arg,pd_entry);
-										}	
-									}
-                       			#endif
         	                	free_pages((unsigned long)(my_pd),0);
 							}
                 		}
@@ -749,10 +553,6 @@ static long rs_ktblmgr_ioctl(struct file *filp, unsigned int cmd, unsigned long 
 		 			}
 		 		}
 			}
-			
-			/*#ifdef ACCESSES_MATRIX
-					reset_accesses(arg);
-			#endif*/
 			
 			original_view[arg]=NULL;
 		}
@@ -850,51 +650,89 @@ static long rs_ktblmgr_ioctl(struct file *filp, unsigned int cmd, unsigned long 
 			}
 		}*/
 		
-		#ifdef ACCESSES_MATRIX
-			
-			/*printk("Printing working set of thread n°%d.\n",arg);
-			if(pgd_addr[arg]==NULL){
-				printk("Can't show information about working set\n");
-				goto exit_from_info;
-			}
-			unsigned char thread_index = THREAD_GROUP_INDEX(arg);
-			unsigned char bit_place = arg - (GROUP_SIZE_BIT * thread_index);
-			accesses_row = accesses[thread_index];
-			for(i=0;i<N2MZONE;i++){
-				if((accesses_row[i] &  bit_set[bit_place]) ==  bit_set[bit_place])
-					printk("WORKING SET: zone number=%d\n",i);
-			}*/
-			
-			printk("active_groups=%d\n",active_groups);
-			printk("Pages accesses\n");
-			for(i=0; i<N2MZONE; i++) {
-				for(j=0; j<active_groups;j++) {
-					cell = ((unsigned char)((char *)(accesses[j]))[i]);
-					if(cell > 0){
-						printk("page %d is busy(group %d)\n",i,j);
-					}
-				}
-			}
-			
-        #endif
-        /*exit_from_info:*/
-        
-        #ifdef ACCESSES_LIST
-        	iterate();
-        #endif
-        
-        #ifdef ACCESSES_ABR
-        	//in_order(abr);
-        	in_order_iterative();
-        #endif
-        
         for(i=0;i<SIBLING_PGD;i++) {
         	if(original_view[i]!=NULL) 
         		printk("original_view[%d]=%p\n",i,original_view[i]);
-        	printk("root_sim_processes[%d]=%d\n",i,root_sim_processes[i]);
-        	
-        		
+        	printk("root_sim_processes[%d]=%d\n",i,root_sim_processes[i]);	
         }
+        
+        /*for(i=0;i<272;i++) {
+        	for(j=0; j<512; j++) {
+        		for(k=0; k<512; k++) {
+        			pd_entry = k >> 6;
+        			zone_num_calc = j << 3;
+        			pd_entry |= zone_num_calc;
+        			zone_num_calc = i << 12;
+        			pd_entry |= zone_num_calc;
+        			printk("entry=%d\n",pd_entry);
+				}
+			}
+		}*/ 
+		
+		#ifdef ACCESSES_HASHBUCKET
+			for(i=0; i<NBUCKETS; i++) {
+				if(buckets[i]!=NULL){
+					control_node * head = buckets[i];
+					printk("head n° %d=%u\n",i,head->node_tracking);
+					for(k=0;k<64;k++) {
+						//unsigned int ctb = constant_test_bit(k,&(head->node_tracking));
+						unsigned int ctb = CHECK_NODE(k,head->node_tracking);
+						if(ctb)
+							printk("bit %d = %d\n",k,ctb);
+						
+					}
+					node * a_node = (node*)head->first_real_node;
+					//printk("bucket n°=%d\n",i);
+					while(a_node!=NULL) {
+						printk("(a_node->h).key_zone=%d\n",(a_node->h).key_zone);
+						unsigned char * pt = (a_node->b).page_table;
+						for(j=0; j<NPTE; j++) {
+							unsigned long * pte = (ulong *)&(pt[(MAX_SIZE_BODY_ENTRY_REAL*j)/*+MAX_SIZE_BODY_ENTRY_REAL*/]);
+							unsigned long pte_l = *pte;
+							//*pte_n = *pte_n << WASTE_BITS;
+							pte_l = pte_l >> WASTE_BITS;
+							if(pte_l>0)
+								printk("pt[%d]=%u\n",j,pte_l);
+							//pt+=MAX_SIZE_BODY_ENTRY_REAL;
+						}
+						a_node = (node *) ((a_node->h).next_node);
+					}
+				}	
+			}
+		#endif
+		
+		/*unsigned char prova[8] = {1,1,1,1,1,1,1,1};
+		unsigned long * l = prova;
+		printk("*l=%ul\n",*l);
+		unsigned int * in = prova;
+		printk("*in=%u\n",*in);
+		in++;
+		printk("*in=%u\n",*in);
+		unsigned short * sh = prova;
+		printk("*sh=%u\n",*sh);
+		sh++;
+		printk("*sh=%u\n",*sh);
+		sh++;
+		printk("*sh=%u\n",*sh);
+		sh++;
+		printk("*sh=%u\n",*sh);
+		unsigned char * c = prova;
+		printk("*c=%u\n",*c);
+		c++;
+		printk("*c=%u\n",*c);
+		c++;
+		printk("*c=%u\n",*c);
+		c++;
+		printk("*c=%u\n",*c);
+		c++;
+		printk("*c=%u\n",*c);
+		c++;
+		printk("*c=%u\n",*c);
+		c++;
+		printk("*c=%u\n",*c);
+		c++;
+		printk("*c=%u\n",*c);*/
+		
         
         break;
 
@@ -1074,12 +912,16 @@ static int rs_ktblmgr_init(void) {
 
 	mutex_init(&pgd_get_mutex);
 	
-	#ifdef ACCESSES_ABR
-		mutex_init(&mutex_node);
+	#ifdef ACCESSES_HASHBUCKET
+		//mutex_init(&hash_mutex);
+		printk("MAX_SIZE_BODY_ENTRY_REAL=%d\n",MAX_SIZE_BODY_ENTRY_REAL);
+		printk("N_NODES_PER_BUCKET=%d\n",N_NODES_PER_BUCKET);
+		printk("sizeof(struct mutex)=%u\n",sizeof(struct mutex));
+		printk("sizeof(struct semaphore)=%u\n",sizeof(struct semaphore));
+		printk("sizeof(spinlock_t)=%u\n",sizeof(spinlock_t));
+		printk("sizeof(rwlock_t)=%u\n",sizeof(rwlock_t));
 	#endif
-    #ifdef ACCESSES_LIST
-    	mutex_init(&mutex_node);
-    #endif
+	
 	// Dynamically allocate a major for the device
 	major = register_chrdev(0, "rs_ktblmgr", &fops);
 	if (major < 0) {
@@ -1111,33 +953,7 @@ static int rs_ktblmgr_init(void) {
 		managed_pgds++;
 	}
 
-	printk(KERN_INFO "Correctly allocated %d sibling pgds\n", managed_pgds);
-    #ifdef ACCESSES_MATRIX
-     accesses[0]=vmalloc(N2MZONE*GROUP_SIZE_BYTE);
-     memset(accesses[0],0,N2MZONE*GROUP_SIZE_BYTE);
-     if(accesses[0]==NULL) {
-     	printk("Error: there isn't structure to track memory accesses\n");
-     	return -1;
-     }
-     else {
-     	printk("accesses[0]=%p\n",accesses[0]);
-     	active_groups++;
-	 }
-	 
-	
-	 
-	 /*for(i=0;i<NGROUPS; i++) {
-	 	accesses[i]=vmalloc(N2MZONE*GROUP_SIZE_BYTE);
-	 	memset(accesses[i],0,N2MZONE*GROUP_SIZE_BYTE);
-	 	active_groups++;	
-	 }*/
-	 
-	 /*for(i=0;i<NGROUPS;i++) {
-	 	accesses[i]=vmalloc(N2MZONE*GROUP_SIZE_BYTE);	
-	 }*/
-     
-    #endif
-     
+	printk(KERN_INFO "Correctly allocated %d sibling pgds\n", managed_pgds);     
     //debug code
     	//original_view[0]=current->mm;
     	/*for(i=0;i<SIBLING_PGD;i++){
@@ -1176,12 +992,6 @@ static void rs_ktblmgr_cleanup(void) {
 		kfree(mm_struct_addr[managed_pgds-1]);
 
 	}
-	#ifdef ACCESSES_MATRIX
-		for(i=0; i < active_groups; i++) {
-			vfree(accesses[i]);
-		}
-	#endif
-
 }
 
 #endif	/* HAVE_LINUX_KERNEL_MAP_MODULE */
