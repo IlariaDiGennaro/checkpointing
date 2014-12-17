@@ -185,7 +185,7 @@ void (*flush_tlb_all_lookup)(void) = NULL;
 	
 	void * buckets[NBUCKETS];
 	//spinlock_t spinlocks[NBUCKETS] = {[0 ... (NBUCKETS-1)]=SPIN_LOCK_UNLOCKED};
-	unsigned char exclusion[NBUCKETS];
+	unsigned char exclusion[NBUCKETS] = {[0 ... (NBUCKETS-1)]=0};
 	//struct mutex hash_mutex;
 	
 	void add_node(void * fault_address,unsigned char pgd_index){
@@ -248,7 +248,7 @@ void (*flush_tlb_all_lookup)(void) = NULL;
 			set_bit((ulong)(pgd_index+WASTE_BITS),pte_long);
 		}
 		//end_add_node: spin_unlock(&(spinlocks[bucket_index]));
-		end_add_node: exclusion[bucket_index]=0;
+		end_add_node: cmpxchg(&(exclusion[bucket_index]),1,0); //unlocked
 		return;	
 	}
 	
@@ -310,6 +310,9 @@ int root_sim_page_fault(struct pt_regs* regs, long error_code){
 			 				}
 			 				else {
 			 					printk("ancestor_pd[%d]=NULL\n",PDE(target_address));
+			 					#ifdef ACCESSES_HASHBUCKET
+			 						add_node(target_address,i);
+			 					#endif
 			 					return 0;
 							}
 			   			}
@@ -915,11 +918,11 @@ static int rs_ktblmgr_init(void) {
 	#ifdef ACCESSES_HASHBUCKET
 		//mutex_init(&hash_mutex);
 		printk("MAX_SIZE_BODY_ENTRY_REAL=%d\n",MAX_SIZE_BODY_ENTRY_REAL);
-		printk("N_NODES_PER_BUCKET=%d\n",N_NODES_PER_BUCKET);
-		printk("sizeof(struct mutex)=%u\n",sizeof(struct mutex));
-		printk("sizeof(struct semaphore)=%u\n",sizeof(struct semaphore));
-		printk("sizeof(spinlock_t)=%u\n",sizeof(spinlock_t));
-		printk("sizeof(rwlock_t)=%u\n",sizeof(rwlock_t));
+		//printk("N_NODES_PER_BUCKET=%d\n",N_NODES_PER_BUCKET);
+		//printk("sizeof(struct mutex)=%u\n",sizeof(struct mutex));
+		//printk("sizeof(struct semaphore)=%u\n",sizeof(struct semaphore));
+		//printk("sizeof(spinlock_t)=%u\n",sizeof(spinlock_t));
+		//printk("sizeof(rwlock_t)=%u\n",sizeof(rwlock_t));
 	#endif
 	
 	// Dynamically allocate a major for the device
