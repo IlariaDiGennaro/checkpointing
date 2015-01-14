@@ -48,6 +48,7 @@
 #include <asm/cacheflush.h>
 #include <linux/uaccess.h>
 #include <linux/vmalloc.h>
+#include <linux/numa.h>
 
 
 
@@ -128,14 +129,23 @@ struct file_operations fops = {
 /// This is to access the actual flush_tlb_all using a kernel proble
 void (*flush_tlb_all_lookup)(void) = NULL;
 
+//ILARIA//
 #define ACCESSES_HASHBUCKET
 /* Tabella Hash con trabocco, ogni entry della tabella punta ad una lista di 64 nodi, ogni nodo rappresenta una pde.
- * In testa ad ogni lista c'è un ulteriore nodo, che punta al primo vero nodo della lista e tiene traccia dei 64
- * nodi presenti nella lista. L'inserimento costa O(1) sia nel caso di lista vuota che non perchè, grazie al nodo
- * "di controllo", viene fatto sempre in testa. Nel caso di nodo già presente, l'aggiornamento del nodo costa al
- * più O(64) per lo scorrimento. Per ogni lista di nodi c'è un semaforo di mutua esclusione realizzato con la
- * Compare-and-Swap (CAS) al byte. Realizzato solo l'inserimento dei nodi nelle varie liste e l'aggiornamento.
- * Non realizzata l'eliminazione.  */
+ * In ogni entry della tabella c'è un semaforo di mutua esclusione realizzato con l'operazione Compare-and-Swap(CAS)
+ * al byte, una maschera di 64 bit (un unsigned long) che tiene traccia dei 64 nodi presenti nella lista tramite  
+ * l'operazione atomica bit_test in bitops.h e il puntatore al primo nodo della lista. L'inserimento costa O(1) 
+ * sia nel caso di lista vuota che non perchè, grazie al nodo "di controllo", viene fatto sempre in testa. 
+ * Nel caso di nodo già presente, l'aggiornamento del nodo costa al più O(64) per lo scorrimento. E' possibile scegliere 
+ * di tracciare gli accessi alle zone di 2Mega in modo singolo "one shot", ovvero sappiamo se un certo thread ha acceduto 
+ * ad una certa zona almeno una volta, o in modo multiplo, ovvero sappiamo se un certo thread ha acceduto ad una certa 
+ * zona e quante volte ha acceduto (contatore). Per contare gli accessi di ogni thread ad una specifica zona, 
+ * vengono abilitati i page fault multipli come in KMAF, ovvero si itera periodicamente sull'architettura delle pagine,
+ * resettando il bit di presenza in ogni PDE e gestendo accuratamente questo "finto" fault senza che venga gestito dalle
+ * abituali routine del kernel(do_page_fault). Ogni nodo ha un header che contiene la chiave, ovvero il numero della
+ * PDE assoluto (PML4|PDPT|PDE 27 bit) e il puntatore al nodo successivo. Ogni nodo ha un body che contiene o un long
+ * per tracciare gli accessi di 64 thread nel modo "one shot" o un array di 64 contatori di taglia arbitraria per contare
+ * gli accessi di 64 thread nel modo dei faul multipli.*/
 #ifdef ACCESSES_HASHBUCKET
 	
 	#define NZONE2M (71303168)
@@ -145,47 +155,94 @@ void (*flush_tlb_all_lookup)(void) = NULL;
 	#define HASH_FUNCTION(address) (unsigned int)(((ulong)address & 0x0000fffff8000000)>>27)
 	#define ZONE2M(address) (unsigned int) (((ulong)address & 0x0000ffffffe00000)>>21)
 	
-	typedef struct{
-		unsigned int key_zone;
+	typedef struct __bucket_data{
+		unsigned long nodes_tracking; //tracking 64 nodes of this bucket
+		void * nodes_list;
+		unsigned char spinlock; //CAS
+	}bucket_data;
+	
+	bucket_data buckets[NBUCKETS];
+	
+	typedef struct __header{
 		void * next_node;
+		unsigned int key_zone;
 	}header;
 	
-	typedef struct{
+	/*typedef struct{
 		unsigned long node_tracking;
 		void * first_real_node;
-	}control_node;
+	}control_node;*/
 	
-	#define SIZE_HEADER (sizeof(header))
-	#define SIZE_CONTROL_NODE (sizeof(control_node))
-	#define SIZE_PAGE_4K (4096)
-	#define NPTE (512)
-	#define MAX_SIZE_BODY_ENTRY ((SIZE_PAGE_4K - SIZE_HEADER)>>9)
-    /*#define M8 (MAX_SIZE_BODY_ENTRY==8?8:0)
-    #define M4 ((MAX_SIZE_BODY_ENTRY>=4 && MAX_SIZE_BODY_ENTRY<8)?4:0)
-    #define M2 ((MAX_SIZE_BODY_ENTRY>=2 && MAX_SIZE_BODY_ENTRY<4)?2:0)
-    #define M1 ((MAX_SIZE_BODY_ENTRY>=1 && MAX_SIZE_BODY_ENTRY<2)?1:0)
-    #define M (M8+M4+M2+M1)*/
-    #define MAX_SIZE_BODY_ENTRY_REAL ((MAX_SIZE_BODY_ENTRY==8?8:0)+((MAX_SIZE_BODY_ENTRY>=4 && MAX_SIZE_BODY_ENTRY<8)?4:0)+((MAX_SIZE_BODY_ENTRY>=2 && MAX_SIZE_BODY_ENTRY<4)?2:0)+((MAX_SIZE_BODY_ENTRY>=1 && MAX_SIZE_BODY_ENTRY<2)?1:0))
- 	#define MAX_NUM_THREAD_PER_ENTRY (MAX_SIZE_BODY_ENTRY_REAL * 8)
- 	#define WASTE_BITS (64-MAX_NUM_THREAD_PER_ENTRY)
- 	#define NODE_GROUP(pde_relative) (pde_relative >> N_NODES_PER_BUCKET_LOG)
- 	#define NODE_BIT(pde_relative) (pde_relative - (NODE_GROUP(pde_relative)<<N_NODES_PER_BUCKET_LOG))
- 	#define CHECK_NODE(number_bit,node_tracking) (((1UL << ((ulong)number_bit & (BITS_PER_LONG -1))) & (node_tracking))>0?1:0)
- 	
-	typedef struct{
-		unsigned char page_table[MAX_SIZE_BODY_ENTRY_REAL * NPTE];
+	#define BODY_ADVANCED
+	#ifndef BODY_ADVANCED
+	
+	typedef struct __body{
+		unsigned long thread_tracking;
 	}body;
 	
-	typedef struct{
+	#endif
+	
+	#ifdef BODY_ADVANCED
+	
+	#define TWOTO8 (256)
+	#define TWOTO16 (TWOTO8*TWOTO8)
+	#define TWOTO32 (TWOTO16*TWOTO16)
+	#define TWOTO64 (TWOTO32*TWOTO32)
+	
+	#define NTHREADS (64)
+	
+	#define SIZE_COUNTER 1
+	#if SIZE_COUNTER==1
+		typedef unsigned char counter_size;
+		#define MAX_VALUE_COUNTER (TWOTO8-1)
+	#elif SIZE_COUNTER==2
+		typedef unsigned short counter_size;
+		#define MAX_VALUE_COUNTER (TWOTO16-1)
+	#elif SIZE_COUNTER==4
+		typedef unsigned int counter_size;
+		#define MAX_VALUE_COUNTER (TWOTO32-1)
+	#elif SIZE_COUNTER==8
+	 	typedef unsigned long counter_size;
+	 	#define MAX_VALUE_COUNTER (TWOTO64-1)
+	#endif
+	
+	//#define SIZE_COUNTER (sizeof(counter_size))
+	
+	//#define MAX_VALUE_COUNTER ((SIZE_COUNTER==1?(TWOTO8-1):0) + (SIZE_COUNTER==2?(TWOTO16-1):0) + (SIZE_COUNTER==4?(TWOTO32-1):0) + (SIZE_COUNTER==8?(TWOTO64-1):0))	
+	
+	typedef struct __body{
+		counter_size thread_tracking[NTHREADS];	
+	}body;
+	
+	#endif
+	
+	typedef struct __node{
 		header h;
 		body b;
 	}node;
 	
 	#define SIZE_NODE (sizeof(node))
-	
-	void * buckets[NBUCKETS];
+	//#define SIZE_HEADER (sizeof(header))
+	//#define SIZE_CONTROL_NODE (sizeof(control_node))
+	//#define SIZE_PAGE_4K (4096)
+	//#define NPTE (512)
+	//#define MAX_SIZE_BODY_ENTRY ((SIZE_PAGE_4K - SIZE_HEADER)>>9)
+    /*#define M8 (MAX_SIZE_BODY_ENTRY==8?8:0)
+    #define M4 ((MAX_SIZE_BODY_ENTRY>=4 && MAX_SIZE_BODY_ENTRY<8)?4:0)
+    #define M2 ((MAX_SIZE_BODY_ENTRY>=2 && MAX_SIZE_BODY_ENTRY<4)?2:0)
+    #define M1 ((MAX_SIZE_BODY_ENTRY>=1 && MAX_SIZE_BODY_ENTRY<2)?1:0)
+    #define M (M8+M4+M2+M1)*/
+    //#define MAX_SIZE_BODY_ENTRY_REAL ((MAX_SIZE_BODY_ENTRY==8?8:0)+((MAX_SIZE_BODY_ENTRY>=4 && MAX_SIZE_BODY_ENTRY<8)?4:0)+((MAX_SIZE_BODY_ENTRY>=2 && MAX_SIZE_BODY_ENTRY<4)?2:0)+((MAX_SIZE_BODY_ENTRY>=1 && MAX_SIZE_BODY_ENTRY<2)?1:0))
+ 	//#define MAX_NUM_THREAD_PER_ENTRY (MAX_SIZE_BODY_ENTRY_REAL * 8)
+ 	#define MAX_NUM_THREAD_PER_ENTRY (64)
+ 	//#define WASTE_BITS (64-MAX_NUM_THREAD_PER_ENTRY)
+ 	#define NODE_GROUP(pde_relative) (pde_relative >> N_NODES_PER_BUCKET_LOG)
+ 	#define NODE_BIT(pde_relative) (pde_relative - (NODE_GROUP(pde_relative)<<N_NODES_PER_BUCKET_LOG))
+ 	#define CHECK_NODE(number_bit,node_tracking) (((1UL << ((ulong)number_bit & (BITS_PER_LONG -1))) & (node_tracking))>0?1:0)
+ 	
+	//void * buckets[NBUCKETS];
 	//spinlock_t spinlocks[NBUCKETS] = {[0 ... (NBUCKETS-1)]=SPIN_LOCK_UNLOCKED};
-	unsigned char exclusion[NBUCKETS] = {[0 ... (NBUCKETS-1)]=0};
+	//unsigned char exclusion[NBUCKETS] = {[0 ... (NBUCKETS-1)]=0};
 	//struct mutex hash_mutex;
 	
 	void add_node(void * fault_address,unsigned char pgd_index){
@@ -193,66 +250,64 @@ void (*flush_tlb_all_lookup)(void) = NULL;
 			
 		unsigned int bucket_index = HASH_FUNCTION(fault_address);
 		//spin_lock(&(spinlocks[bucket_index]));
-		while(cmpxchg(&(exclusion[bucket_index]),0,1)); //while(lock==1)==while(locked)
+		#define bucket (buckets[bucket_index])
+		while(cmpxchg(&(bucket.spinlock),0,1)); //while(lock==1)==while(locked)
 		printk("bucket_index=%d\n",bucket_index);
 		printk("key_zone=%d\n",ZONE2M(fault_address));
 		printk("pte=%d\n",PTE(fault_address));
 		printk("pde_relative=%d\n",PDE(fault_address));
-		control_node * head;
+		//control_node * head;
 		node * a_node;
-		if(buckets[bucket_index]==NULL) {
-			head = kzalloc(SIZE_CONTROL_NODE,GFP_KERNEL);
+		if(!CHECK_NODE(NODE_BIT(PDE(fault_address)),bucket.nodes_tracking)) {
 			a_node=kzalloc(SIZE_NODE,GFP_KERNEL);
 			(a_node -> h).key_zone = ZONE2M(fault_address);
-			head->first_real_node=(void *) a_node;
-			set_bit(NODE_BIT(PDE(fault_address)),&(head->node_tracking));
+			(a_node->h).next_node = bucket.nodes_list;
+			(bucket.nodes_list) = (void *)a_node;
+			set_bit(NODE_BIT(PDE(fault_address)),&(bucket.nodes_tracking));
 			//unsigned int tb = test_bit(NODE_BIT(PDE(fault_address)),&(head->node_tracking));
 			//printk("tb=%u\n",tb);
-			buckets[bucket_index]=head;
 			goto update_body;
 		}
 		else {
-			head = buckets[bucket_index];
+			a_node = (node *)(bucket.nodes_list);
 			//if(!constant_test_bit(NODE_BIT(PDE(fault_address)),&(head->node_tracking))) {
-			if(!CHECK_NODE(NODE_BIT(PDE(fault_address)),head->node_tracking)) {
-				node * new_node = kzalloc(SIZE_NODE,GFP_KERNEL);
-				(new_node->h).key_zone=ZONE2M(fault_address);
-				(new_node->h).next_node = head->first_real_node;
-				head->first_real_node=new_node;
-				set_bit(NODE_BIT(PDE(fault_address)),&(head->node_tracking));
-				a_node = new_node;
-				goto update_body;
-			}
-			else {
-				a_node = head->first_real_node;
-				while((a_node->h).next_node!=NULL) {
-					if((a_node->h).key_zone == ZONE2M(fault_address))
-						goto update_body;
-					a_node = (node *) ((a_node->h).next_node);
-				}
-				if((a_node->h).key_zone==ZONE2M(fault_address))
+			while((a_node->h).next_node!=NULL) {
+				if((a_node->h).key_zone == ZONE2M(fault_address))
 					goto update_body;
+				a_node = (node *) ((a_node->h).next_node);
 			}
+			if((a_node->h).key_zone==ZONE2M(fault_address))
+				goto update_body;
 		}
 		
 		update_body: 
+		#ifndef BODY_ADVANCED
+		//printk("a_node=%p\n",a_node);
 		if(pgd_index>=MAX_NUM_THREAD_PER_ENTRY)
 			goto end_add_node;
 		else {
-			unsigned char * pt = (unsigned char *)((a_node->b).page_table);
-			printk("pt=%p\n",pt);
-			unsigned char * pte = &(pt[MAX_SIZE_BODY_ENTRY_REAL*PTE(fault_address)]);
-			ulong * pte_long = (ulong *) pte;
-			printk("pte_long=%p,*pte_long=%u, sizeof(*pte_long)=%d\n",pte_long,*pte_long,sizeof(*pte_long));
-			//printk("WASTE_BITS=%d\n",WASTE_BITS);
-			set_bit((ulong)(pgd_index+WASTE_BITS),pte_long);
+			ulong * address_tracking = &((a_node->b).thread_tracking);
+			set_bit((ulong)(pgd_index),address_tracking);
 		}
+		#endif
+		#ifdef BODY_ADVANCED
+		if(pgd_index>=NTHREADS)
+			goto end_add_node;
+		else {
+			if(((a_node->b).thread_tracking)[pgd_index]==MAX_VALUE_COUNTER)
+				goto end_add_node;
+			((a_node->b).thread_tracking)[pgd_index]++;
+			printk("((a_node->b).thread_tracking)[%d]=%d\n",pgd_index,((a_node->b).thread_tracking)[pgd_index]);
+		}
+		#endif
 		//end_add_node: spin_unlock(&(spinlocks[bucket_index]));
-		end_add_node: cmpxchg(&(exclusion[bucket_index]),1,0); //unlocked
+		end_add_node: cmpxchg(&(bucket.spinlock),1,0); //unlocked
+		#undef bucket
 		return;	
 	}
 	
 #endif
+//END ILARIA//
 
 int root_sim_page_fault(struct pt_regs* regs, long error_code){
  	void* target_address;
@@ -263,6 +318,7 @@ int root_sim_page_fault(struct pt_regs* regs, long error_code){
     void ** my_pd;
     void ** ancestor_pd;
     void * address;
+    void ** my_pt;
     
 	if(current->mm == NULL) return 0;  /* this is a kernel thread - not a rootsim thread */
                                            /* i kernel thread hanno current->mm=NULL di regola */
@@ -294,25 +350,52 @@ int root_sim_page_fault(struct pt_regs* regs, long error_code){
 			 					my_pd = (void **)__va((ulong) my_pdp[PDP(target_address)] & 0xfffffffffffff000);
 			 					if(my_pd[PDE(target_address)]!=NULL){
 			 						printk("my_pd[%d]!=NULL\n",PDE(target_address));
-			 						#ifdef ACCESSES_HASHBUCKET
-			 							add_node(target_address,i);
-			 						#endif
-			 						return 0;
+			 						printk("my_pd[%d] presence bit = %d\n",PDE(target_address),(ulong)(my_pd[PDE(target_address)]) & 0x1);
+			 						printk("my_pd[%d]=%p - ancestor_pd[%d]=%p\n",PDE(target_address),my_pd[PDE(target_address)],PDE(target_address),ancestor_pd[PDE(target_address)]);
+			 						//ILARIA//
+			 						if(((ulong)(my_pd[PDE(target_address)]) & 0x1) == 0) {
+			 							my_pd[PDE(target_address)] = (ulong) my_pd[PDE(target_address)] | 1;
+			 							//naviga tutta la struttura e vedi se ci sono tutti i livelli ritorna 1 sennò 0
+			 							my_pt = (void **) __va((ulong) my_pd[PDE(target_address)] & 0xfffffffffffff000);
+			 							if(my_pt[PTE(target_address)]==NULL)
+			 								goto true_fault;
+			 							else {
+			 								printk("false fault\n");
+			 								#ifdef ACCESSES_HASHBUCKET
+			 									add_node(target_address,i);
+			 								#endif
+			 								return 1;
+			 							}
+									}
+									else {
+										printk("true fault\n");
+			 							true_fault: 
+			 							#ifdef ACCESSES_HASHBUCKET
+			 								add_node(target_address,i);
+			 							#endif
+			 							return 0;
+									}
+									//END ILARIA//
 								}
 			 					else {
 			 						printk("my_pd[%d]=NULL\n",PDE(target_address));
 			 						my_pd[PDE(target_address)]=(ulong)ancestor_pd[PDE(target_address)];
+			 						//ILARIA//
 			 						#ifdef ACCESSES_HASHBUCKET
 			 							add_node(target_address,i);
 			 						#endif
+									//my_pd[PDE(target_address)]=((ulong)my_pd[PDE(target_address)] & 0xfffffffffffffffe);
+									//END ILARIA//
 			 						return 1;
 			 					}
 			 				}
 			 				else {
 			 					printk("ancestor_pd[%d]=NULL\n",PDE(target_address));
+			 					//ILARIA//
 			 					#ifdef ACCESSES_HASHBUCKET
 			 						add_node(target_address,i);
 			 					#endif
+			 					//END ILARIA//
 			 					return 0;
 							}
 			   			}
@@ -597,8 +680,9 @@ static long rs_ktblmgr_ioctl(struct file *filp, unsigned int cmd, unsigned long 
 	   
 		printk("printing info\n");
         //printk("pgd_addr[%d]=%p\n",arg,pgd_addr[arg]);
-        //pgd_entry = (void **) pgd_addr[arg];
-        
+        pgd_entry = (void **) pgd_addr[arg];
+        if(pgd_entry==NULL)
+        	break;
         /*for(i=0; i<512; i++) {
         	if(ancestor_pml4[i]!=NULL){
             	printk("ancestor_pml4[%d]=%p\n",i,ancestor_pml4[i]);
@@ -637,13 +721,17 @@ static long rs_ktblmgr_ioctl(struct file *filp, unsigned int cmd, unsigned long 
                 			for(k=0;k<512;k++){
 								if(my_pd[k]!=NULL) {
 									printk("my_pd[%d]=%p\n",k,my_pd[k]);
-									if(((ulong)my_pd[k] & 0x080)==0x000){ //4Kbyte page
-										my_pt = (void**) __va((ulong)my_pd[k] & 0xfffffffffffff000);
-										for(h=0;h<512;h++){
-											if(my_pt[h]!=NULL)
-												printk("my_pt[%d]=%p\n",h,my_pt[h]);
-										}
-									}
+									#ifdef BODY_ADVANCED
+									my_pd[k] = (ulong)(my_pd[k]) & 0xfffffffffffffffe;
+									#endif
+									//printk("my_pd[%d]=%p\n",k,my_pd[k]);
+									//if(((ulong)my_pd[k] & 0x080)==0x000){ //4Kbyte page
+									//	my_pt = (void**) __va((ulong)my_pd[k] & 0xfffffffffffff000);
+									//	for(h=0;h<512;h++){
+									//		if(my_pt[h]!=NULL)
+									//			printk("my_pt[%d]=%p\n",h,my_pt[h]);
+									//	}
+									//}
 								}
 							}
                 		}	
@@ -653,56 +741,85 @@ static long rs_ktblmgr_ioctl(struct file *filp, unsigned int cmd, unsigned long 
 			}
 		}*/
 		
-        for(i=0;i<SIBLING_PGD;i++) {
+        /*for(i=0;i<SIBLING_PGD;i++) {
         	if(original_view[i]!=NULL) 
         		printk("original_view[%d]=%p\n",i,original_view[i]);
         	printk("root_sim_processes[%d]=%d\n",i,root_sim_processes[i]);	
-        }
+        }*/
         
-        /*for(i=0;i<272;i++) {
+        /*unsigned int set;
+        unsigned int a_bucket;
+        unsigned int counter;
+        
+        for(i=0;i<272;i++) {
+        	printk("i\n");
         	for(j=0; j<512; j++) {
+        		printk("j\n");
         		for(k=0; k<512; k++) {
+        			printk("k\n");
         			pd_entry = k >> 6;
         			zone_num_calc = j << 3;
         			pd_entry |= zone_num_calc;
         			zone_num_calc = i << 12;
         			pd_entry |= zone_num_calc;
-        			printk("entry=%d\n",pd_entry);
+        			if(set==0) {
+        		        printk("set\n");
+        				a_bucket=pd_entry;
+        				printk("a_bucket=%d\n",a_bucket);
+        				counter++;
+        				set=1;
+					}
+					else {
+                    	if(a_bucket==pd_entry)
+                    		counter++;
+					}
+        			//printk("entry=%d\n",pd_entry);
 				}
 			}
-		}*/ 
+		}
+		printk("counter=%d\n",counter);*/ 
 		
+		//ILARIA//
 		#ifdef ACCESSES_HASHBUCKET
+			//bucket_data bd = buckets[0];
+			//printk("bd.nodes_list=%p\n",bd.nodes_list);
+			//printk("bd.spinlock=%u,&(bd.spinlock)=%p\n",bd.spinlock,&(bd.spinlock));
+			//printk("bd.nodes_tracking=%u, &(bd.nodes_tracking)=%p\n",bd.nodes_tracking,&(bd.nodes_tracking));
 			for(i=0; i<NBUCKETS; i++) {
-				if(buckets[i]!=NULL){
-					control_node * head = buckets[i];
-					printk("head n° %d=%u\n",i,head->node_tracking);
+				bucket_data bd = buckets[i];
+				if((bd.nodes_tracking)>0) {
+					printk("bucket data n° %d=%u\n",i,bd.nodes_tracking);
 					for(k=0;k<64;k++) {
 						//unsigned int ctb = constant_test_bit(k,&(head->node_tracking));
-						unsigned int ctb = CHECK_NODE(k,head->node_tracking);
+						unsigned int ctb = CHECK_NODE(k,bd.nodes_tracking);
 						if(ctb)
-							printk("bit %d = %d\n",k,ctb);
-						
+							printk("bit %d = %d\n",k,ctb);		
 					}
-					node * a_node = (node*)head->first_real_node;
+					node * a_node = (node*)bd.nodes_list;
+					
 					//printk("bucket n°=%d\n",i);
 					while(a_node!=NULL) {
+					#define track ((a_node->b).thread_tracking)
 						printk("(a_node->h).key_zone=%d\n",(a_node->h).key_zone);
-						unsigned char * pt = (a_node->b).page_table;
-						for(j=0; j<NPTE; j++) {
-							unsigned long * pte = (ulong *)&(pt[(MAX_SIZE_BODY_ENTRY_REAL*j)/*+MAX_SIZE_BODY_ENTRY_REAL*/]);
-							unsigned long pte_l = *pte;
-							//*pte_n = *pte_n << WASTE_BITS;
-							pte_l = pte_l >> WASTE_BITS;
-							if(pte_l>0)
-								printk("pt[%d]=%u\n",j,pte_l);
-							//pt+=MAX_SIZE_BODY_ENTRY_REAL;
+						for(j=0; j<64; j++) {
+							#ifndef BODY_ADVANCED
+							unsigned int ctb = CHECK_NODE(j,track);
+							if(ctb)
+								printk("thread %d = %d\n",j,ctb);
+							#endif
+							
+							#ifdef BODY_ADVANCED
+								if(track[j]>0)
+									printk("thread %d = %d\n",j,track[j]);
+							#endif
 						}
+					#undef track
 						a_node = (node *) ((a_node->h).next_node);
-					}
-				}	
+					}	
+				}
 			}
 		#endif
+		//END ILARIA//
 		
 		/*unsigned char prova[8] = {1,1,1,1,1,1,1,1};
 		unsigned long * l = prova;
@@ -736,6 +853,8 @@ static long rs_ktblmgr_ioctl(struct file *filp, unsigned int cmd, unsigned long 
 		c++;
 		printk("*c=%u\n",*c);*/
 		
+
+        
         
         break;
 
@@ -882,6 +1001,45 @@ static long rs_ktblmgr_ioctl(struct file *filp, unsigned int cmd, unsigned long 
 			address = PML4_PLUS_ONE(address);
 		}// end lopp pn PML4	
 		break;
+	
+	//ILARIA//
+	case IOCTL_ITERATE_PAGE:
+		pgd_entry = (void **) pgd_addr[arg];
+        if(pgd_entry==NULL)
+        	break;
+        for(i=0; i<512; i++) {
+        	if(pgd_entry[i]!=NULL){
+            	//printk("pgd_entry[%d]=%p\n",i,pgd_entry[i]);
+                if(((ulong)pgd_entry[i] & 0x4)==0x4){
+                	my_pdp = (void**) __va((ulong) pgd_entry[i] & 0xfffffffffffff000);
+                	for(j=0; j<512; j++){
+                		if(my_pdp[j]!=NULL) {
+                			//printk("my_pdp[%d]=%p\n",j,my_pdp[j]);
+                			my_pd = (void **) __va((ulong) my_pdp[j] & 0xfffffffffffff000);
+                			for(k=0;k<512;k++){
+								if(my_pd[k]!=NULL) {
+									printk("my_pd[%d]=%p\n",k,my_pd[k]);
+									#ifdef BODY_ADVANCED
+									my_pd[k] = (ulong)(my_pd[k]) & 0xfffffffffffffffe;
+									#endif
+									//printk("my_pd[%d]=%p\n",k,my_pd[k]);
+									//if(((ulong)my_pd[k] & 0x080)==0x000){ //4Kbyte page
+									//	my_pt = (void**) __va((ulong)my_pd[k] & 0xfffffffffffff000);
+									//	for(h=0;h<512;h++){
+									//		if(my_pt[h]!=NULL)
+									//			printk("my_pt[%d]=%p\n",h,my_pt[h]);
+									//	}
+									//}
+								}
+							}
+                		}	
+                	}	
+                }
+                else break;
+			}
+		}
+		break;
+		//END ILARIA//
 
 	default:
 		ret = -EINVAL;
@@ -916,8 +1074,21 @@ static int rs_ktblmgr_init(void) {
 	mutex_init(&pgd_get_mutex);
 	
 	#ifdef ACCESSES_HASHBUCKET
+		printk("sizeof(bucket_data)=%d\n",sizeof(bucket_data));
+		printk("sizeof(header)=%d\n",sizeof(header));
+		printk("sizeof(body)=%d\n",sizeof(body));
+		printk("sizeof(node)=%d\n",sizeof(node));
+		int nid = numa_node_id();
+		printk("nid=%d\n",nid);
+		struct page * prova = alloc_page(GFP_KERNEL);
+		printk("prova = %p\n",prova);
+		printk("MAX_NUMNODES=%d\n",MAX_NUMNODES);
+		#ifdef BODY_ADVANCED
+		printk("MAX_VALUE_COUNTER=%d\n",MAX_VALUE_COUNTER);
+		printk("SIZE_COUNTER=%d\n",SIZE_COUNTER);
+		#endif
 		//mutex_init(&hash_mutex);
-		printk("MAX_SIZE_BODY_ENTRY_REAL=%d\n",MAX_SIZE_BODY_ENTRY_REAL);
+		//printk("MAX_SIZE_BODY_ENTRY_REAL=%d\n",MAX_SIZE_BODY_ENTRY_REAL);
 		//printk("N_NODES_PER_BUCKET=%d\n",N_NODES_PER_BUCKET);
 		//printk("sizeof(struct mutex)=%u\n",sizeof(struct mutex));
 		//printk("sizeof(struct semaphore)=%u\n",sizeof(struct semaphore));
@@ -998,3 +1169,4 @@ static void rs_ktblmgr_cleanup(void) {
 }
 
 #endif	/* HAVE_LINUX_KERNEL_MAP_MODULE */
+
